@@ -24,6 +24,8 @@
 
 #include "params.h"
 
+#include <openssl/sha.h>
+
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -36,8 +38,6 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/types.h>
-#include <openssl/sha.h>
-
 
 #ifdef HAVE_SYS_XATTR_H
 #include <sys/xattr.h>
@@ -45,18 +45,18 @@
 
 #include "log.h"
 
-#define MAX_BLOCKS 160
+#define BLOCK_SIZE 4096 
 #define SHA_DIGEST_LENGTH 20
 
-unsigned char blocks[MAX_BLOCKS][SHA_DIGEST_LENGTH];
-int block_count=0;
+int blockstore_fd ; //file descriptor for blockstore
+int hashstore_fd ; //file descriptor for hashstore
+int block_count = 0; //number of blocks written to blockstore 
 
 //  All the paths I see are relative to the root of the mounted
 //  filesystem.  In order to get to the underlying filesystem, I need to
 //  have the mountpoint.  I'll save it away early on in main(), and then
 //  whenever I need a path for something I'll call this to construct
 //  it.
-
 static void bb_fullpath(char fpath[PATH_MAX], const char *path)
 {
     strcpy(fpath, BB_DATA->rootdir);
@@ -91,6 +91,9 @@ int bb_getattr(const char *path, struct stat *statbuf)
     
     log_stat(statbuf);
     
+
+    statbuf->st_size = (statbuf->st_size / 4)*BLOCK_SIZE; //scaling the size of the file
+    statbuf->st_blocks = (statbuf->st_size/512);
     return retstat;
 }
 
@@ -337,33 +340,55 @@ int bb_open(const char *path, struct fuse_file_info *fi)
 // can return with anything up to the amount of data requested. nor
 // with the fusexmp code which returns the amount of data also
 // returned by read.
+
 int bb_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
-    int retstat = 0;
-    
+    int retstat = 0, bno, fds;
     log_msg("\nbb_read(path=\"%s\", buf=0x%08x, size=%d, offset=%lld, fi=0x%08x)\n",
-	    path, buf, size, offset, fi);
+        path, buf, size, offset, fi);
     // no need to get fpath on this one, since I work from fi->fh not the path
     log_fi(fi);
 
-    return log_syscall("pread", pread(fi->fh, buf, size, offset), 0);
+    log_msg("   block store and file fd value: %d, %d\n",fds,fi->fh);
+    retstat = log_syscall("pread", pread(fi->fh, (char*)&bno, 4, sizeof(int)*(offset/BLOCK_SIZE)), 0);
+    if(retstat<0){ 
+        close(fds);
+        return retstat;
+    }
+    retstat = log_syscall("pread", pread(blockstore_fd, buf, size, bno*BLOCK_SIZE+offset%BLOCK_SIZE), 0);
+    log_msg("   block store index: %d, size of buf %d, read bytes %d\n",bno,size,retstat);
+    return retstat;
 }
 
 
-int hash_check(const char *buf)
-{
-    unsigned char hash[SHA_DIGEST_LENGTH];
-    SHA1(buf, strlen(buf)-1, hash);
 
-    int i;
-    for(i=0;i<block_count;i++){
-        if(strcmp(hash,blocks[i]) == 0){
-            return i;
+int hash_check(unsigned char *hash)
+{
+    unsigned char stored_hash[SHA_DIGEST_LENGTH]; 
+    // SHA1(buf, sizeof(buf), hash); 
+
+    lseek(hashstore_fd, 0, SEEK_SET);//reading hashstore file from the start
+
+    int found = -1;//this is set to one if the block to be written is already present in  the blockstore
+    int temp_status;
+    int j=0;
+
+    for(;j<block_count;j++){            
+        if((temp_status = pread(hashstore_fd, stored_hash, SHA_DIGEST_LENGTH, j*SHA_DIGEST_LENGTH)) < 0){
+            log_msg("\nError occured while searching for hash in hashstore\n");
+            return -1;
+        }
+        else if(temp_status == 0){
+            break;
+        }
+        else{
+            if(memcmp(hash, stored_hash,SHA_DIGEST_LENGTH) == 0){
+                found = j;
+                break;
+            }    
         }
     }
-    strcpy(blocks[block_count+1] , hash);
-    block_count++;
-    return -1;
+    return found; 
 }
 
 
@@ -376,41 +401,65 @@ int hash_check(const char *buf)
  * Changed in version 2.2
  */
 // As  with read(), the documentation above is inconsistent with the
-// documentation for the write() system call.
+// documentation for the write() system call.   
+
 int bb_write(const char *path, const char *buf, size_t size, off_t offset,
 	     struct fuse_file_info *fi)
 {
     int retstat = 0;
-    log_msg("%s,%d",buf,size);
+    
     log_msg("\nbb_write(path=\"%s\", buf=0x%08x, size=%d, offset=%lld, fi=0x%08x)\n",
 	    path, buf, size, offset, fi
 	    );
-    // no need to get fpath on this one, since I work from fi->fh not the path
     log_fi(fi);
-    char tmp_buf[4096], blocknum[10], filename[PATH_MAX];
 
-    for(int i=0 ; i<=(size/4096) ; i++){
+    // int i=0,j=0; //temporary variables
+    
+    unsigned char tmp_buf[BLOCK_SIZE]; // This array stores the data to be written in a single block
 
-        strncpy(tmp_buf, buf+(i*4096), 4096);
+    int tot_blocks = size / BLOCK_SIZE; // Assuming size of data to write will be multiple of 4KB
+    int i = 0; //iterator in while loop below
+    for(;i<tot_blocks;i++){ //writing data blockwise
+        // calculating hash of the block which is to be written
 
-        int ret = hash_check(tmp_buf);
-        if(ret == -1){
-            // open a block in blockstore and get fd
-            strcpy(filename,"/tmp/blockstore/");
-            sprintf(blocknum, "%d", block_count);
-            strcat(filename,blocknum);
-            int fd = open(filename ,O_WRONLY);
+        strncpy(tmp_buf, buf+(i*BLOCK_SIZE), BLOCK_SIZE);
 
-            log_syscall("pwrite", pwrite(fd, tmp_buf, 4096, 0), 0);
+        log_msg("%s",tmp_buf);
+
+        unsigned char hash[SHA_DIGEST_LENGTH];
+        SHA1(tmp_buf, sizeof(tmp_buf), hash);
+
+        int found = hash_check(hash);
+
+        if(found == -1){
+
+            if(pwrite(hashstore_fd, hash, SHA_DIGEST_LENGTH, block_count*SHA_DIGEST_LENGTH) <0){
+                log_msg("\nhashstore write failed\n");
+                return -1;
+            }
+            if(pwrite(blockstore_fd, tmp_buf, BLOCK_SIZE, block_count*BLOCK_SIZE) <0){
+                log_msg("\nblockstore write failed\n");
+                return -1;
+            }
+
+            block_count++;//since new block written to block store
+
+            log_syscall("pwrite", pwrite(fi->fh, (char*)(&block_count), 4, 4*((offset/BLOCK_SIZE) + i) ), 0);  
         }
-        else{
-            sprintf(blocknum, "%d", ret);
+
+        else{ 
+
+            // char * temp_write = IntToString(found);
+            log_syscall("pwrite", pwrite(fi->fh, (char*)(&block_count), 4, 4*((offset/BLOCK_SIZE) + i) ), 0);
         }
 
-        retstat += log_syscall("pwrite", pwrite(fi->fh, blocknum, strlen(blocknum), offset), 0);
-    }   
+        retstat+=BLOCK_SIZE; 
+    }
+
     return retstat;
 }
+
+
 
 /** Get file system statistics
  *
@@ -747,6 +796,14 @@ void *bb_init(struct fuse_conn_info *conn)
  */
 void bb_destroy(void *userdata)
 {
+    // Deleting '/tmp/blockstore' file
+    log_msg("Deleting '/tmp/blockstore' file\n");
+    log_syscall("unlink", unlink("/tmp/blockstore"), 0);
+
+    //Deleting '/tmp/hashstore' file
+    log_msg("Deleting '/tmp/hashstore' file\n");
+    log_syscall("unlink", unlink("/tmp/hashstore"), 0);
+
     log_msg("\nbb_destroy(userdata=0x%08x)\n", userdata);
 }
 
@@ -851,6 +908,9 @@ int bb_fgetattr(const char *path, struct stat *statbuf, struct fuse_file_info *f
     if (retstat < 0)
 	retstat = log_error("bb_fgetattr fstat");
     
+    printf("\nbb_getattr : %ld\n",statbuf->st_size * (BLOCK_SIZE/4));
+    statbuf->st_size = (statbuf->st_size/4) * BLOCK_SIZE; //scaling the size of the file
+    statbuf->st_blocks = (statbuf->st_size/512);
     log_stat(statbuf);
     
     return retstat;
@@ -950,6 +1010,20 @@ int main(int argc, char *argv[])
     
     bb_data->logfile = log_open();
     
+
+    //opening block store /tmp/blockstore    
+    blockstore_fd = open("/tmp/blockstore", O_RDWR | O_CREAT, S_IWUSR | S_IRUSR | S_IRGRP | S_IWGRP);
+    if (blockstore_fd < 0) {
+        printf("Failed to open block store!  ");
+        return -1;
+    }
+
+    //opening hash store /tmp/hashstore
+    hashstore_fd = open("/tmp/hashstore", O_RDWR | O_CREAT, S_IWUSR | S_IRUSR | S_IRGRP | S_IWGRP);
+    if (hashstore_fd < 0) {
+        printf("Failed to open hash store!  ");
+        return -1;
+    }
     // turn over control to fuse
     fprintf(stderr, "about to call fuse_main\n");
     fuse_stat = fuse_main(argc, argv, &bb_oper, bb_data);
